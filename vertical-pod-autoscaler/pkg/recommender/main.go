@@ -90,6 +90,11 @@ var (
 	prometheusBearerTokenFile = flag.String("prometheus-bearer-token-file", "", "Path to the bearer token file used for authentication by the Prometheus server")
 )
 
+// PromQL query flags
+var (
+	promqlQueries = flag.String("promql-queries", "", `Semicolon-separated list of PromQL queries to execute during each recommendation cycle for additional memory values (optional)`)
+)
+
 // External metrics provider flags
 var (
 	useExternalMetrics   = flag.Bool("use-external-metrics", false, "ALPHA.  Use an external metrics provider instead of metrics_server.")
@@ -290,6 +295,30 @@ func run(ctx context.Context, healthCheck *metrics.HealthCheck, commonFlag *comm
 
 	ignoredNamespaces := strings.Split(commonFlag.IgnoredVpaObjectNamespaces, ",")
 
+	// Create PromQL client if queries are configured
+	var promqlClient input.PromQLClient
+	promqlQueries := input.ParsePromQLQueries(*promqlQueries)
+	if len(promqlQueries) > 0 {
+		promHistoryConfig := history.PrometheusHistoryProviderConfig{
+			Address:      *prometheusAddress,
+			Insecure:     *prometheusInsecure,
+			QueryTimeout: promQueryTimeout,
+			Authentication: history.PrometheusCredentials{
+				BearerToken: *prometheusBearerToken,
+				Username:    *username,
+				Password:    *password,
+			},
+		}
+		var err error
+		promqlClient, err = input.NewPromQLClient(promHistoryConfig, promqlQueries)
+		if err != nil {
+			klog.ErrorS(err, "Failed to create PromQL client")
+			promqlClient = nil
+		} else {
+			klog.V(1).InfoS("PromQL client created with queries", "count", len(promqlQueries), "queries", promqlQueries)
+		}
+	}
+
 	clusterStateFeeder := input.ClusterStateFeederFactory{
 		PodLister:           podLister,
 		OOMObserver:         oomObserver,
@@ -304,8 +333,19 @@ func run(ctx context.Context, healthCheck *metrics.HealthCheck, commonFlag *comm
 		RecommenderName:     *recommenderName,
 		IgnoredNamespaces:   ignoredNamespaces,
 		VpaObjectNamespace:  commonFlag.VpaObjectNamespace,
+		PromQLClient:        promqlClient,
 	}.Make()
 	controllerFetcher.Start(ctx, scaleCacheLoopPeriod)
+
+	// Create the pod resource recommender with cluster state for PromQL support
+	var podResourceRecommender logic.PodResourceRecommender
+	if promqlClient != nil {
+		// Use PromQL-aware recommender when PromQL client is available
+		podResourceRecommender = logic.CreatePodResourceRecommenderWithClusterState(clusterState)
+	} else {
+		// Use standard recommender when no PromQL client
+		podResourceRecommender = logic.CreatePodResourceRecommender()
+	}
 
 	recommender := routines.RecommenderFactory{
 		ClusterState:                 clusterState,
@@ -313,7 +353,7 @@ func run(ctx context.Context, healthCheck *metrics.HealthCheck, commonFlag *comm
 		ControllerFetcher:            controllerFetcher,
 		CheckpointWriter:             checkpoint.NewCheckpointWriter(clusterState, vpa_clientset.NewForConfigOrDie(config).AutoscalingV1()),
 		VpaClient:                    vpa_clientset.NewForConfigOrDie(config).AutoscalingV1(),
-		PodResourceRecommender:       logic.CreatePodResourceRecommender(),
+		PodResourceRecommender:       podResourceRecommender,
 		RecommendationPostProcessors: postProcessors,
 		CheckpointsGCInterval:        *checkpointsGCInterval,
 		UseCheckpoints:               useCheckpoints,

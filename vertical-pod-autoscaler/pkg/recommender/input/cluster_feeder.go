@@ -90,6 +90,7 @@ type ClusterStateFeederFactory struct {
 	RecommenderName     string
 	IgnoredNamespaces   []string
 	VpaObjectNamespace  string
+	PromQLClient        PromQLClient
 }
 
 // Make creates new ClusterStateFeeder with internal data providers, based on kube client.
@@ -108,6 +109,7 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		recommenderName:     m.RecommenderName,
 		ignoredNamespaces:   m.IgnoredNamespaces,
 		vpaObjectNamespace:  m.VpaObjectNamespace,
+		promqlClient:        m.PromQLClient,
 	}
 }
 
@@ -214,6 +216,7 @@ type clusterStateFeeder struct {
 	recommenderName     string
 	ignoredNamespaces   []string
 	vpaObjectNamespace  string
+	promqlClient        PromQLClient
 }
 
 func (feeder *clusterStateFeeder) InitFromHistoryProvider(historyProvider history.HistoryProvider) {
@@ -520,6 +523,30 @@ func (feeder *clusterStateFeeder) LoadRealTimeMetrics(ctx context.Context) {
 		}
 	}
 	klog.V(3).InfoS("ClusterSpec fed with ContainerUsageSamples", "sampleCount", sampleCount, "containerCount", len(containersMetrics), "droppedSampleCount", droppedSampleCount)
+
+	// Execute PromQL queries if configured
+	if feeder.promqlClient != nil {
+		promqlResults, err := feeder.promqlClient.ExecuteQueries(ctx)
+		if err != nil {
+			klog.ErrorS(err, "Failed to execute PromQL queries")
+		} else if len(promqlResults) > 0 {
+			// Store PromQL memory values for each pod (already aggregated to max values)
+			podMemoryCount := 0
+			for _, result := range promqlResults {
+				// Only store memory values for pods that exist in the cluster state
+				if _, exists := feeder.clusterState.Pods()[result.PodID]; exists {
+					// Directly assign the max memory value returned by PromQL client
+					feeder.clusterState.SetPodPromQLMemory(result.PodID, result.MemoryBytes)
+					podMemoryCount++
+				} else {
+					klog.V(4).InfoS("Skipping PromQL result for unknown pod", "podID", result.PodID, "memoryBytes", model.BytesFromMemoryAmount(result.MemoryBytes))
+				}
+			}
+
+			klog.V(3).InfoS("PromQL queries executed", "podsWithData", podMemoryCount)
+		}
+	}
+
 Loop:
 	for {
 		select {

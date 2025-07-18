@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
+	"k8s.io/klog/v2"
 )
 
 // ResourceEstimator is a function from AggregateContainerState to
@@ -38,6 +39,77 @@ type CPUEstimator interface {
 // MemoryEstimator predicts memory resources needed by a container
 type MemoryEstimator interface {
 	GetMemoryEstimation(s *model.AggregateContainerState) model.ResourceAmount
+}
+
+// PromQLAwareMemoryEstimator is a memory estimator that uses PromQL data when available,
+// falling back to histogram-based estimation otherwise
+type PromQLAwareMemoryEstimator struct {
+	baseEstimator MemoryEstimator
+	clusterState  model.ClusterState
+	containerName string
+	vpa           *model.Vpa
+}
+
+// NewPromQLAwareMemoryEstimator creates a new PromQL-aware memory estimator
+func NewPromQLAwareMemoryEstimator(baseEstimator MemoryEstimator, clusterState model.ClusterState) MemoryEstimator {
+	return &PromQLAwareMemoryEstimator{
+		baseEstimator: baseEstimator,
+		clusterState:  clusterState,
+	}
+}
+
+// GetMemoryEstimation returns memory estimation using PromQL data if available, otherwise falls back to base estimator
+func (e *PromQLAwareMemoryEstimator) GetMemoryEstimation(s *model.AggregateContainerState) model.ResourceAmount {
+	// Try to get PromQL-based memory estimation
+	if promqlMemory := e.getPromQLMemoryEstimation(); promqlMemory > 0 {
+		klog.V(2).Infof("Using PromQL memory estimation for container %s", e.containerName)
+		return promqlMemory
+	}
+
+	klog.V(2).Infof("Falling back to histogram memory estimation for container %s", e.containerName)
+	// Fall back to histogram-based estimation
+	return e.baseEstimator.GetMemoryEstimation(s)
+}
+
+// getPromQLMemoryEstimation aggregates PromQL memory data for the container across all matching pods
+func (e *PromQLAwareMemoryEstimator) getPromQLMemoryEstimation() model.ResourceAmount {
+	if e.vpa == nil {
+		return 0
+	}
+
+	// Get all pods matching this VPA
+	matchingPods := e.clusterState.GetMatchingPods(e.vpa)
+	if len(matchingPods) == 0 {
+		return 0
+	}
+
+	var maxMemory model.ResourceAmount = 0
+	foundAnyData := false
+
+	// Iterate through all matching pods and find the maximum PromQL memory value
+	for _, podID := range matchingPods {
+		if memoryAmount, exists := e.clusterState.GetPodPromQLMemory(podID); exists {
+			foundAnyData = true
+			if memoryAmount > maxMemory {
+				maxMemory = memoryAmount
+			}
+		}
+	}
+
+	if !foundAnyData {
+		return 0
+	}
+
+	klog.V(3).Infof("PromQL memory aggregation for VPA %s/%s: found data for %d pods, max memory: %d bytes",
+		e.vpa.ID.Namespace, e.vpa.ID.VpaName, len(matchingPods), maxMemory)
+
+	return maxMemory
+}
+
+// SetVPAContext sets the VPA context for this estimator (needed for finding matching pods)
+func (e *PromQLAwareMemoryEstimator) SetVPAContext(vpa *model.Vpa, containerName string) {
+	e.vpa = vpa
+	e.containerName = containerName
 }
 
 // combinedEstimator is a ResourceEstimator that combines two estimators: one for CPU and one for memory.

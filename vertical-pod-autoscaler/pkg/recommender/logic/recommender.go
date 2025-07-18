@@ -68,9 +68,11 @@ type podResourceRecommender struct {
 	lowerBoundMemory MemoryEstimator
 	upperBoundCPU    CPUEstimator
 	upperBoundMemory MemoryEstimator
+	clusterState     model.ClusterState
 }
 
-func (r *podResourceRecommender) GetRecommendedPodResources(containerNameToAggregateStateMap model.ContainerNameToAggregateStateMap) RecommendedPodResources {
+// GetRecommendedPodResourcesWithVPA computes resource recommendation for a VPA object with PromQL support.
+func (r *podResourceRecommender) GetRecommendedPodResourcesWithVPA(containerNameToAggregateStateMap model.ContainerNameToAggregateStateMap, vpa *model.Vpa) RecommendedPodResources {
 	var recommendation = make(RecommendedPodResources)
 	if len(containerNameToAggregateStateMap) == 0 {
 		return recommendation
@@ -87,12 +89,42 @@ func (r *podResourceRecommender) GetRecommendedPodResources(containerNameToAggre
 		WithMemoryMinResource(minMemory, r.lowerBoundMemory),
 		WithCPUMinResource(minCPU, r.upperBoundCPU),
 		WithMemoryMinResource(minMemory, r.upperBoundMemory),
+		r.clusterState,
 	}
 
 	for containerName, aggregatedContainerState := range containerNameToAggregateStateMap {
+		// Set VPA context for PromQL-aware memory estimators
+		r.setVPAContextForEstimators(vpa, containerName)
 		recommendation[containerName] = recommender.estimateContainerResources(aggregatedContainerState)
 	}
 	return recommendation
+}
+
+func (r *podResourceRecommender) GetRecommendedPodResources(containerNameToAggregateStateMap model.ContainerNameToAggregateStateMap) RecommendedPodResources {
+	// This method is kept for backward compatibility, but won't have PromQL support
+	return r.GetRecommendedPodResourcesWithVPA(containerNameToAggregateStateMap, nil)
+}
+
+// setVPAContextForEstimators sets VPA context for PromQL-aware memory estimators
+func (r *podResourceRecommender) setVPAContextForEstimators(vpa *model.Vpa, containerName string) {
+	if vpa == nil {
+		return
+	}
+
+	// Set context for target memory estimator
+	if promqlEstimator, ok := r.targetMemory.(*PromQLAwareMemoryEstimator); ok {
+		promqlEstimator.SetVPAContext(vpa, containerName)
+	}
+
+	// Set context for lower bound memory estimator
+	if promqlEstimator, ok := r.lowerBoundMemory.(*PromQLAwareMemoryEstimator); ok {
+		promqlEstimator.SetVPAContext(vpa, containerName)
+	}
+
+	// Set context for upper bound memory estimator
+	if promqlEstimator, ok := r.upperBoundMemory.(*PromQLAwareMemoryEstimator); ok {
+		promqlEstimator.SetVPAContext(vpa, containerName)
+	}
 }
 
 // Takes AggregateContainerState and returns a container recommendation.
@@ -121,6 +153,11 @@ func FilterControlledResources(estimation model.Resources, controlledResources [
 
 // CreatePodResourceRecommender returns the primary recommender.
 func CreatePodResourceRecommender() PodResourceRecommender {
+	return CreatePodResourceRecommenderWithClusterState(nil)
+}
+
+// CreatePodResourceRecommenderWithClusterState returns the primary recommender with PromQL support.
+func CreatePodResourceRecommenderWithClusterState(clusterState model.ClusterState) PodResourceRecommender {
 	targetCPU := NewPercentileCPUEstimator(*targetCPUPercentile)
 	lowerBoundCPU := NewPercentileCPUEstimator(*lowerBoundCPUPercentile)
 	upperBoundCPU := NewPercentileCPUEstimator(*upperBoundCPUPercentile)
@@ -129,6 +166,13 @@ func CreatePodResourceRecommender() PodResourceRecommender {
 	targetMemory := NewPercentileMemoryEstimator(*targetMemoryPercentile)
 	lowerBoundMemory := NewPercentileMemoryEstimator(*lowerBoundMemoryPercentile)
 	upperBoundMemory := NewPercentileMemoryEstimator(*upperBoundMemoryPercentile)
+
+	// Wrap memory estimators with PromQL-aware estimators if clusterState is available
+	if clusterState != nil {
+		targetMemory = NewPromQLAwareMemoryEstimator(targetMemory, clusterState)
+		lowerBoundMemory = NewPromQLAwareMemoryEstimator(lowerBoundMemory, clusterState)
+		upperBoundMemory = NewPromQLAwareMemoryEstimator(upperBoundMemory, clusterState)
+	}
 
 	// Apply safety margins
 	targetCPU = WithCPUMargin(*safetyMarginFraction, targetCPU)
@@ -175,6 +219,7 @@ func CreatePodResourceRecommender() PodResourceRecommender {
 		lowerBoundMemory,
 		upperBoundCPU,
 		upperBoundMemory,
+		clusterState,
 	}
 }
 

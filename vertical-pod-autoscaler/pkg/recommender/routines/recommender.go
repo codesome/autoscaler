@@ -81,7 +81,17 @@ func (r *recommender) GetClusterStateFeeder() input.ClusterStateFeeder {
 }
 
 func processVPAUpdate(r *recommender, vpa *model.Vpa, observedVpa *v1.VerticalPodAutoscaler) {
-	resources := r.podResourceRecommender.GetRecommendedPodResources(GetContainerNameToAggregateStateMap(vpa))
+	// Use the new VPA-aware method that supports PromQL memory estimation
+	var resources logic.RecommendedPodResources
+	if podResourceRecommenderWithVPA, ok := r.podResourceRecommender.(interface {
+		GetRecommendedPodResourcesWithVPA(model.ContainerNameToAggregateStateMap, *model.Vpa) logic.RecommendedPodResources
+	}); ok {
+		resources = podResourceRecommenderWithVPA.GetRecommendedPodResourcesWithVPA(GetContainerNameToAggregateStateMap(vpa), vpa)
+	} else {
+		// Fall back to the original method if the new interface is not available
+		resources = r.podResourceRecommender.GetRecommendedPodResources(GetContainerNameToAggregateStateMap(vpa))
+	}
+
 	had := vpa.HasRecommendation()
 
 	listOfResourceRecommendation := logic.MapToListOfRecommendedContainerResources(resources)
