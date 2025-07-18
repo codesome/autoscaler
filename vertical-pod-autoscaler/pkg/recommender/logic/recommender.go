@@ -68,7 +68,6 @@ type podResourceRecommender struct {
 	lowerBoundMemory MemoryEstimator
 	upperBoundCPU    CPUEstimator
 	upperBoundMemory MemoryEstimator
-	clusterState     model.ClusterState
 }
 
 // GetRecommendedPodResourcesWithVPA computes resource recommendation for a VPA object with PromQL support.
@@ -153,11 +152,6 @@ func FilterControlledResources(estimation model.Resources, controlledResources [
 
 // CreatePodResourceRecommender returns the primary recommender.
 func CreatePodResourceRecommender() PodResourceRecommender {
-	return CreatePodResourceRecommenderWithClusterState(nil)
-}
-
-// CreatePodResourceRecommenderWithClusterState returns the primary recommender with PromQL support.
-func CreatePodResourceRecommenderWithClusterState(clusterState model.ClusterState) PodResourceRecommender {
 	targetCPU := NewPercentileCPUEstimator(*targetCPUPercentile)
 	lowerBoundCPU := NewPercentileCPUEstimator(*lowerBoundCPUPercentile)
 	upperBoundCPU := NewPercentileCPUEstimator(*upperBoundCPUPercentile)
@@ -166,13 +160,6 @@ func CreatePodResourceRecommenderWithClusterState(clusterState model.ClusterStat
 	targetMemory := NewPercentileMemoryEstimator(*targetMemoryPercentile)
 	lowerBoundMemory := NewPercentileMemoryEstimator(*lowerBoundMemoryPercentile)
 	upperBoundMemory := NewPercentileMemoryEstimator(*upperBoundMemoryPercentile)
-
-	// Wrap memory estimators with PromQL-aware estimators if clusterState is available
-	if clusterState != nil {
-		targetMemory = NewPromQLAwareMemoryEstimator(targetMemory, clusterState)
-		lowerBoundMemory = NewPromQLAwareMemoryEstimator(lowerBoundMemory, clusterState)
-		upperBoundMemory = NewPromQLAwareMemoryEstimator(upperBoundMemory, clusterState)
-	}
 
 	// Apply safety margins
 	targetCPU = WithCPUMargin(*safetyMarginFraction, targetCPU)

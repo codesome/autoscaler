@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kubernetes/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -30,7 +31,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
-	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher/controllerfetcher"
 	metrics_recommender "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/recommender"
 	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -70,6 +71,7 @@ type recommender struct {
 	lastAggregateContainerStateGC time.Time
 	recommendationPostProcessor   []RecommendationPostProcessor
 	updateWorkerCount             int
+	vpaPromQLExecutor             *logic.VPAPromQLExecutor
 }
 
 func (r *recommender) GetClusterState() model.ClusterState {
@@ -81,15 +83,31 @@ func (r *recommender) GetClusterStateFeeder() input.ClusterStateFeeder {
 }
 
 func processVPAUpdate(r *recommender, vpa *model.Vpa, observedVpa *v1.VerticalPodAutoscaler) {
-	// Use the new VPA-aware method that supports PromQL memory estimation
-	var resources logic.RecommendedPodResources
-	if podResourceRecommenderWithVPA, ok := r.podResourceRecommender.(interface {
-		GetRecommendedPodResourcesWithVPA(model.ContainerNameToAggregateStateMap, *model.Vpa) logic.RecommendedPodResources
-	}); ok {
-		resources = podResourceRecommenderWithVPA.GetRecommendedPodResourcesWithVPA(GetContainerNameToAggregateStateMap(vpa), vpa)
-	} else {
-		// Fall back to the original method if the new interface is not available
-		resources = r.podResourceRecommender.GetRecommendedPodResources(GetContainerNameToAggregateStateMap(vpa))
+	// Get standard histogram-based recommendations
+	resources := r.podResourceRecommender.GetRecommendedPodResources(GetContainerNameToAggregateStateMap(vpa))
+
+	// Override with PromQL-based memory recommendations if available
+	if r.vpaPromQLExecutor != nil {
+		promqlResults, err := r.vpaPromQLExecutor.ExecuteVPAPromQLQueries(context.Background(), vpa)
+		if err != nil {
+			klog.Warningf("Failed to execute PromQL queries for VPA %s/%s: %v", vpa.ID.Namespace, vpa.ID.VpaName, err)
+		} else if len(promqlResults) > 0 {
+			// Override memory recommendations with PromQL results
+			for _, result := range promqlResults {
+				if containerResources, exists := resources[result.ContainerName]; exists {
+					klog.V(2).Infof("Overriding memory recommendation for container %s in VPA %s/%s: %d bytes (from PromQL)",
+						result.ContainerName, vpa.ID.Namespace, vpa.ID.VpaName, result.MemoryBytes)
+
+					// Override all memory recommendations (target, lower bound, upper bound) with PromQL result
+					containerResources.Target[model.ResourceMemory] = result.MemoryBytes
+					containerResources.LowerBound[model.ResourceMemory] = result.MemoryBytes
+					containerResources.UpperBound[model.ResourceMemory] = result.MemoryBytes
+					resources[result.ContainerName] = containerResources
+				} else {
+					klog.V(3).Infof("PromQL result for container %s not applied - no existing resource recommendation", result.ContainerName)
+				}
+			}
+		}
 	}
 
 	had := vpa.HasRecommendation()
@@ -225,11 +243,26 @@ type RecommenderFactory struct {
 	CheckpointsGCInterval time.Duration
 	UseCheckpoints        bool
 	UpdateWorkerCount     int
+
+	// Prometheus configuration for VPA PromQL queries
+	PrometheusConfig *history.PrometheusHistoryProviderConfig
 }
 
 // Make creates a new recommender instance,
 // which can be run in order to provide continuous resource recommendations for containers.
 func (c RecommenderFactory) Make() Recommender {
+	// Create VPA PromQL executor if Prometheus configuration is provided
+	var vpaPromQLExecutor *logic.VPAPromQLExecutor
+	if c.PrometheusConfig != nil {
+		executor, err := logic.NewVPAPromQLExecutor(*c.PrometheusConfig)
+		if err != nil {
+			klog.Warningf("Failed to create VPA PromQL executor: %v", err)
+		} else {
+			vpaPromQLExecutor = executor
+			klog.V(1).Info("VPA PromQL executor created successfully")
+		}
+	}
+
 	recommender := &recommender{
 		clusterState:                  c.ClusterState,
 		clusterStateFeeder:            c.ClusterStateFeeder,
@@ -243,6 +276,7 @@ func (c RecommenderFactory) Make() Recommender {
 		lastAggregateContainerStateGC: time.Now(),
 		lastCheckpointGC:              time.Now(),
 		updateWorkerCount:             c.UpdateWorkerCount,
+		vpaPromQLExecutor:             vpaPromQLExecutor,
 	}
 	klog.V(3).InfoS("New Recommender created", "recommender", recommender)
 	return recommender

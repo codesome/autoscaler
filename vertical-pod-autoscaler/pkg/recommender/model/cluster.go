@@ -60,8 +60,6 @@ type ClusterState interface {
 	SetObservedVPAs([]*vpa_types.VerticalPodAutoscaler)
 	ObservedVPAs() []*vpa_types.VerticalPodAutoscaler
 	Pods() map[PodID]*PodState
-	SetPodPromQLMemory(podID PodID, memoryAmount ResourceAmount)
-	GetPodPromQLMemory(podID PodID) (ResourceAmount, bool)
 }
 
 type clusterState struct {
@@ -84,9 +82,6 @@ type clusterState struct {
 
 	lastAggregateContainerStateGC time.Time
 	gcInterval                    time.Duration
-
-	// PromQL memory values per pod
-	podPromQLMemory map[PodID]ResourceAmount
 }
 
 // StateMapSize is the number of pods being tracked by the VPA
@@ -136,7 +131,6 @@ func NewClusterState(gcInterval time.Duration) *clusterState {
 		labelSetMap:                   make(labelSetMap),
 		lastAggregateContainerStateGC: time.Unix(0, 0),
 		gcInterval:                    gcInterval,
-		podPromQLMemory:               make(map[PodID]ResourceAmount),
 	}
 }
 
@@ -554,15 +548,4 @@ func (k aggregateStateKey) Labels() labels.Labels {
 		return labels.Set{}
 	}
 	return (*k.labelSetMap)[k.labelSetKey]
-}
-
-// SetPodPromQLMemory sets the PromQL memory value for a specific pod
-func (cluster *clusterState) SetPodPromQLMemory(podID PodID, memoryAmount ResourceAmount) {
-	cluster.podPromQLMemory[podID] = memoryAmount
-}
-
-// GetPodPromQLMemory returns the PromQL memory value for a specific pod
-func (cluster *clusterState) GetPodPromQLMemory(podID PodID) (ResourceAmount, bool) {
-	memoryAmount, exists := cluster.podPromQLMemory[podID]
-	return memoryAmount, exists
 }
