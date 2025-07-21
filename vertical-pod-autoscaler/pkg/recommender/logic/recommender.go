@@ -70,8 +70,7 @@ type podResourceRecommender struct {
 	upperBoundMemory MemoryEstimator
 }
 
-// GetRecommendedPodResourcesWithVPA computes resource recommendation for a VPA object with PromQL support.
-func (r *podResourceRecommender) GetRecommendedPodResourcesWithVPA(containerNameToAggregateStateMap model.ContainerNameToAggregateStateMap, vpa *model.Vpa) RecommendedPodResources {
+func (r *podResourceRecommender) GetRecommendedPodResources(containerNameToAggregateStateMap model.ContainerNameToAggregateStateMap) RecommendedPodResources {
 	var recommendation = make(RecommendedPodResources)
 	if len(containerNameToAggregateStateMap) == 0 {
 		return recommendation
@@ -88,42 +87,12 @@ func (r *podResourceRecommender) GetRecommendedPodResourcesWithVPA(containerName
 		WithMemoryMinResource(minMemory, r.lowerBoundMemory),
 		WithCPUMinResource(minCPU, r.upperBoundCPU),
 		WithMemoryMinResource(minMemory, r.upperBoundMemory),
-		r.clusterState,
 	}
 
 	for containerName, aggregatedContainerState := range containerNameToAggregateStateMap {
-		// Set VPA context for PromQL-aware memory estimators
-		r.setVPAContextForEstimators(vpa, containerName)
 		recommendation[containerName] = recommender.estimateContainerResources(aggregatedContainerState)
 	}
 	return recommendation
-}
-
-func (r *podResourceRecommender) GetRecommendedPodResources(containerNameToAggregateStateMap model.ContainerNameToAggregateStateMap) RecommendedPodResources {
-	// This method is kept for backward compatibility, but won't have PromQL support
-	return r.GetRecommendedPodResourcesWithVPA(containerNameToAggregateStateMap, nil)
-}
-
-// setVPAContextForEstimators sets VPA context for PromQL-aware memory estimators
-func (r *podResourceRecommender) setVPAContextForEstimators(vpa *model.Vpa, containerName string) {
-	if vpa == nil {
-		return
-	}
-
-	// Set context for target memory estimator
-	if promqlEstimator, ok := r.targetMemory.(*PromQLAwareMemoryEstimator); ok {
-		promqlEstimator.SetVPAContext(vpa, containerName)
-	}
-
-	// Set context for lower bound memory estimator
-	if promqlEstimator, ok := r.lowerBoundMemory.(*PromQLAwareMemoryEstimator); ok {
-		promqlEstimator.SetVPAContext(vpa, containerName)
-	}
-
-	// Set context for upper bound memory estimator
-	if promqlEstimator, ok := r.upperBoundMemory.(*PromQLAwareMemoryEstimator); ok {
-		promqlEstimator.SetVPAContext(vpa, containerName)
-	}
 }
 
 // Takes AggregateContainerState and returns a container recommendation.
@@ -206,7 +175,6 @@ func CreatePodResourceRecommender() PodResourceRecommender {
 		lowerBoundMemory,
 		upperBoundCPU,
 		upperBoundMemory,
-		clusterState,
 	}
 }
 

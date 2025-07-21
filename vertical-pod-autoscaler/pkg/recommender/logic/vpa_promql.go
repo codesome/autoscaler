@@ -7,7 +7,7 @@ import (
 	"time"
 
 	promapi "github.com/prometheus/client_golang/api"
-	promv1 "github.com/prometheus/client_golang/api/v1"
+	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	prommodel "github.com/prometheus/common/model"
 	"k8s.io/klog/v2"
 
@@ -70,7 +70,7 @@ func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *mo
 	for i, query := range queries {
 		klog.V(3).Infof("Executing PromQL query %d for VPA %s/%s: %s", i+1, vpa.ID.Namespace, vpa.ID.VpaName, query)
 
-		result, err := e.promClient.Query(ctx, query, time.Now())
+		result, _, err := e.promClient.Query(ctx, query, time.Now())
 		if err != nil {
 			klog.Warningf("Failed to execute PromQL query for VPA %s/%s: %v", vpa.ID.Namespace, vpa.ID.VpaName, err)
 			continue
@@ -114,29 +114,34 @@ func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *mo
 // extractContainerMemoryFromResult extracts container memory values from Prometheus query result
 func (e *VPAPromQLExecutor) extractContainerMemoryFromResult(result prommodel.Value) ([]ContainerMemoryResult, error) {
 	switch v := result.(type) {
-	case prommodel.Scalar:
-		return nil, fmt.Errorf("scalar results are not supported - use vector queries with container labels")
-	case prommodel.Vector:
-		var results []ContainerMemoryResult
-		for _, sample := range v {
-			memoryBytes, err := extractMemoryBytes(sample.Value)
-			if err != nil {
-				klog.V(4).Infof("Skipping sample with invalid memory value: %v", err)
-				continue
-			}
-
-			containerName, err := extractContainerName(sample.Metric)
-			if err != nil {
-				klog.V(4).Infof("Skipping sample without valid container label: %v", err)
-				continue
-			}
-
-			results = append(results, ContainerMemoryResult{
-				ContainerName: containerName,
-				MemoryBytes:   memoryBytes,
-			})
+	case *prommodel.Scalar:
+		// Accept scalar values and apply as memory recommendation
+		memoryBytes, err := extractMemoryBytes(v.Value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memory value in scalar result: %v", err)
 		}
-		return results, nil
+
+		return []ContainerMemoryResult{{
+			ContainerName: "default",
+			MemoryBytes:   memoryBytes,
+		}}, nil
+	case prommodel.Vector:
+		// Ensure vector has only 1 sample
+		if len(v) != 1 {
+			return nil, fmt.Errorf("vector result must contain exactly 1 sample, got %d samples", len(v))
+		}
+
+		sample := v[0]
+		memoryBytes, err := extractMemoryBytes(sample.Value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memory value in vector sample: %v", err)
+		}
+
+		// Apply the memory recommendation without checking container names
+		return []ContainerMemoryResult{{
+			ContainerName: "default",
+			MemoryBytes:   memoryBytes,
+		}}, nil
 	default:
 		return nil, fmt.Errorf("unsupported result type: %T", result)
 	}

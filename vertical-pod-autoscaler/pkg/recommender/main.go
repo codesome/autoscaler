@@ -307,9 +307,6 @@ func run(ctx context.Context, healthCheck *metrics.HealthCheck, commonFlag *comm
 	}.Make()
 	controllerFetcher.Start(ctx, scaleCacheLoopPeriod)
 
-	// Create the pod resource recommender
-	podResourceRecommender := logic.CreatePodResourceRecommender()
-
 	// Create Prometheus configuration for VPA PromQL queries
 	promQueryTimeout, err := time.ParseDuration(*queryTimeout)
 	if err != nil {
@@ -334,7 +331,7 @@ func run(ctx context.Context, healthCheck *metrics.HealthCheck, commonFlag *comm
 		ControllerFetcher:            controllerFetcher,
 		CheckpointWriter:             checkpoint.NewCheckpointWriter(clusterState, vpa_clientset.NewForConfigOrDie(config).AutoscalingV1()),
 		VpaClient:                    vpa_clientset.NewForConfigOrDie(config).AutoscalingV1(),
-		PodResourceRecommender:       podResourceRecommender,
+		PodResourceRecommender:       logic.CreatePodResourceRecommender(),
 		RecommendationPostProcessors: postProcessors,
 		CheckpointsGCInterval:        *checkpointsGCInterval,
 		UseCheckpoints:               useCheckpoints,

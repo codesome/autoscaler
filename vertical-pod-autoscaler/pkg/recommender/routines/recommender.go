@@ -22,16 +22,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubernetes/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	vpa_api "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/checkpoint"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
-	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher/controllerfetcher"
+	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	metrics_recommender "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/recommender"
 	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -251,18 +251,6 @@ type RecommenderFactory struct {
 // Make creates a new recommender instance,
 // which can be run in order to provide continuous resource recommendations for containers.
 func (c RecommenderFactory) Make() Recommender {
-	// Create VPA PromQL executor if Prometheus configuration is provided
-	var vpaPromQLExecutor *logic.VPAPromQLExecutor
-	if c.PrometheusConfig != nil {
-		executor, err := logic.NewVPAPromQLExecutor(*c.PrometheusConfig)
-		if err != nil {
-			klog.Warningf("Failed to create VPA PromQL executor: %v", err)
-		} else {
-			vpaPromQLExecutor = executor
-			klog.V(1).Info("VPA PromQL executor created successfully")
-		}
-	}
-
 	recommender := &recommender{
 		clusterState:                  c.ClusterState,
 		clusterStateFeeder:            c.ClusterStateFeeder,
@@ -276,8 +264,19 @@ func (c RecommenderFactory) Make() Recommender {
 		lastAggregateContainerStateGC: time.Now(),
 		lastCheckpointGC:              time.Now(),
 		updateWorkerCount:             c.UpdateWorkerCount,
-		vpaPromQLExecutor:             vpaPromQLExecutor,
 	}
+
+	// Create VPA PromQL executor if Prometheus configuration is provided
+	if c.PrometheusConfig != nil {
+		executor, err := logic.NewVPAPromQLExecutor(*c.PrometheusConfig)
+		if err != nil {
+			klog.Warningf("Failed to create VPA PromQL executor: %v", err)
+		} else {
+			recommender.vpaPromQLExecutor = executor
+			klog.V(1).Info("VPA PromQL executor created successfully")
+		}
+	}
+
 	klog.V(3).InfoS("New Recommender created", "recommender", recommender)
 	return recommender
 }
