@@ -17,7 +17,7 @@ import (
 
 const (
 	// VPA annotation prefix for PromQL queries
-	VPAPromQLQueriesAnnotationPrefix = "vpa.k8s.io/promql-memory-queries/"
+	VPAPromQLQueriesAnnotationPrefix = "vpa.k8s.io/promql-memory-queries."
 )
 
 // VPAPromQLExecutor handles execution of PromQL queries from VPA annotations
