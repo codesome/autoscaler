@@ -84,6 +84,28 @@ func (r *recommender) GetClusterStateFeeder() input.ClusterStateFeeder {
 	return r.clusterStateFeeder
 }
 
+// hasRecentOOM checks if a container has recent OOM events within the specified duration
+func (r *recommender) hasRecentOOM(vpa *model.Vpa, containerName string, duration time.Duration) bool {
+	// Find matching pods for this VPA
+	matchingPods := r.clusterState.GetMatchingPods(vpa)
+
+	for _, podID := range matchingPods {
+		containerID := model.ContainerID{
+			PodID:         podID,
+			ContainerName: containerName,
+		}
+
+		containerState := r.clusterState.GetContainer(containerID)
+		if containerState != nil {
+			// Check if there was a recent OOM within the specified duration
+			if containerState.HasRecentOOM(duration) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func processVPAUpdate(r *recommender, vpa *model.Vpa, observedVpa *v1.VerticalPodAutoscaler) {
 	// Always get standard histogram-based recommendations as the base
 	resources := r.podResourceRecommender.GetRecommendedPodResources(GetContainerNameToAggregateStateMap(vpa))
@@ -107,7 +129,9 @@ func processVPAUpdate(r *recommender, vpa *model.Vpa, observedVpa *v1.VerticalPo
 		r.lastPromQLRecommendationsMutex.RUnlock()
 
 		// Try to get new PromQL recommendations
-		promqlResults, err := r.vpaPromQLExecutor.ExecuteVPAPromQLQueries(context.Background(), vpa)
+		promqlResults, err := r.vpaPromQLExecutor.ExecuteVPAPromQLQueries(context.Background(), vpa, func(containerName string) bool {
+			return r.hasRecentOOM(vpa, containerName, 5*time.Minute)
+		})
 		if err != nil {
 			klog.Warningf("Failed to execute PromQL queries for VPA %s/%s: %v", vpa.ID.Namespace, vpa.ID.VpaName, err)
 		} else if len(promqlResults) > 0 {
@@ -120,6 +144,13 @@ func processVPAUpdate(r *recommender, vpa *model.Vpa, observedVpa *v1.VerticalPo
 		}
 
 		for containerName, memory := range recommendationOverrides {
+			// Check if this container has recent OOMs within last 10 minutes - skip PromQL override if so
+			if r.hasRecentOOM(vpa, containerName, 5*time.Minute) {
+				klog.Warningf("Skipping PromQL override for container %s in VPA %s/%s due to recent OOM event",
+					containerName, vpa.ID.Namespace, vpa.ID.VpaName)
+				continue
+			}
+
 			if _, exists := resources[containerName]; !exists {
 				resources[containerName] = logic.RecommendedContainerResources{
 					Target:     make(model.Resources),

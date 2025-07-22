@@ -46,7 +46,7 @@ type ContainerMemoryResult struct {
 }
 
 // ExecuteVPAPromQLQueries executes PromQL queries from VPA annotations and returns container memory recommendations
-func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *model.Vpa) ([]ContainerMemoryResult, error) {
+func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *model.Vpa, skipContainer func(containerName string) bool) ([]ContainerMemoryResult, error) {
 	if vpa.Annotations == nil {
 		return nil, nil
 	}
@@ -72,6 +72,9 @@ func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *mo
 	containerMaxMemory := make(map[string]model.ResourceAmount)
 
 	for containerName, queryString := range containerQueries {
+		if skipContainer(containerName) {
+			continue
+		}
 		// Parse semicolon-separated queries for this container
 		queries := parsePromQLQueries(queryString)
 		if len(queries) == 0 {

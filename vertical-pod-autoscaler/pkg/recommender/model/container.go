@@ -56,6 +56,8 @@ type ContainerState struct {
 	WindowEnd time.Time
 	// Start of the latest memory usage sample that was aggregated.
 	lastMemorySampleStart time.Time
+	// Timestamp of the last OOM event for this container.
+	lastOOMTimestamp time.Time
 	// Aggregation to add usage samples to.
 	aggregator ContainerStateAggregator
 }
@@ -67,6 +69,7 @@ func NewContainerState(request Resources, aggregator ContainerStateAggregator) *
 		LastCPUSampleStart:    time.Time{},
 		WindowEnd:             time.Time{},
 		lastMemorySampleStart: time.Time{},
+		lastOOMTimestamp:      time.Time{},
 		aggregator:            aggregator,
 	}
 }
@@ -123,6 +126,14 @@ func (container *ContainerState) observeQualityMetrics(usage ResourceAmount, isO
 // GetMaxMemoryPeak returns maximum memory usage in the sample, possibly estimated from OOM
 func (container *ContainerState) GetMaxMemoryPeak() ResourceAmount {
 	return ResourceAmountMax(container.memoryPeak, container.oomPeak)
+}
+
+// HasRecentOOM returns true if there was an OOM event within the specified duration from now
+func (container *ContainerState) HasRecentOOM(duration time.Duration) bool {
+	if container.lastOOMTimestamp.IsZero() {
+		return false
+	}
+	return time.Since(container.lastOOMTimestamp) <= duration
 }
 
 func (container *ContainerState) addMemorySample(sample *ContainerUsageSample, isOOM bool) bool {
@@ -186,6 +197,10 @@ func (container *ContainerState) RecordOOM(timestamp time.Time, requestedMemory 
 	if timestamp.Before(container.WindowEnd.Add(-1 * GetAggregationsConfig().MemoryAggregationInterval)) {
 		return fmt.Errorf("OOM event will be discarded - it is too old (%v)", timestamp)
 	}
+
+	// Update the last OOM timestamp
+	container.lastOOMTimestamp = timestamp
+
 	// Get max of the request and the recent usage-based memory peak.
 	// Omitting oomPeak here to protect against recommendation running too high on subsequent OOMs.
 	memoryUsed := ResourceAmountMax(requestedMemory, container.memoryPeak)
