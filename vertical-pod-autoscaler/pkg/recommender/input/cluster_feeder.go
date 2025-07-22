@@ -520,7 +520,6 @@ func (feeder *clusterStateFeeder) LoadRealTimeMetrics(ctx context.Context) {
 		}
 	}
 	klog.V(3).InfoS("ClusterSpec fed with ContainerUsageSamples", "sampleCount", sampleCount, "containerCount", len(containersMetrics), "droppedSampleCount", droppedSampleCount)
-
 Loop:
 	for {
 		select {
