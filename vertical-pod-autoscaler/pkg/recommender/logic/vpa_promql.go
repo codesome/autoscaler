@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	// VPA annotation keys for PromQL queries
-	VPAPromQLQueriesAnnotation = "vpa.k8s.io/promql-memory-queries"
+	// VPA annotation prefix for PromQL queries
+	VPAPromQLQueriesAnnotationPrefix = "vpa.k8s.io/promql-memory-queries/"
 )
 
 // VPAPromQLExecutor handles execution of PromQL queries from VPA annotations
@@ -51,45 +51,54 @@ func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *mo
 		return nil, nil
 	}
 
-	queriesAnnotation, exists := vpa.Annotations[VPAPromQLQueriesAnnotation]
-	if !exists || queriesAnnotation == "" {
+	// Find all PromQL query annotations with the format "vpa.k8s.io/promql-memory-queries/<container_name>"
+	containerQueries := make(map[string]string)
+	for annotationKey, query := range vpa.Annotations {
+		if strings.HasPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix) {
+			containerName := strings.TrimPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix)
+			if containerName != "" && query != "" {
+				containerQueries[containerName] = query
+			}
+		}
+	}
+
+	if len(containerQueries) == 0 {
 		return nil, nil
 	}
 
-	// Parse semicolon-separated queries
-	queries := parsePromQLQueries(queriesAnnotation)
-	if len(queries) == 0 {
-		return nil, nil
-	}
-
-	klog.V(2).Infof("Executing %d PromQL queries for VPA %s/%s", len(queries), vpa.ID.Namespace, vpa.ID.VpaName)
+	klog.V(2).Infof("Executing PromQL queries for %d containers in VPA %s/%s", len(containerQueries), vpa.ID.Namespace, vpa.ID.VpaName)
 
 	// Track maximum memory per container across all queries
 	containerMaxMemory := make(map[string]model.ResourceAmount)
 
-	for i, query := range queries {
-		klog.V(3).Infof("Executing PromQL query %d for VPA %s/%s: %s", i+1, vpa.ID.Namespace, vpa.ID.VpaName, query)
-
-		result, _, err := e.promClient.Query(ctx, query, time.Now())
-		if err != nil {
-			klog.Warningf("Failed to execute PromQL query for VPA %s/%s: %v", vpa.ID.Namespace, vpa.ID.VpaName, err)
+	for containerName, queryString := range containerQueries {
+		// Parse semicolon-separated queries for this container
+		queries := parsePromQLQueries(queryString)
+		if len(queries) == 0 {
 			continue
 		}
 
-		containerResults, err := e.extractContainerMemoryFromResult(result)
-		if err != nil {
-			klog.Warningf("Failed to extract container memory from PromQL result for VPA %s/%s: %v", vpa.ID.Namespace, vpa.ID.VpaName, err)
-			continue
-		}
+		klog.V(3).Infof("Container %s in VPA %s/%s has %d PromQL queries", containerName, vpa.ID.Namespace, vpa.ID.VpaName, len(queries))
 
-		// Aggregate maximum memory per container
-		for _, containerResult := range containerResults {
-			if existingMax, exists := containerMaxMemory[containerResult.ContainerName]; exists {
-				if containerResult.MemoryBytes > existingMax {
-					containerMaxMemory[containerResult.ContainerName] = containerResult.MemoryBytes
-				}
-			} else {
-				containerMaxMemory[containerResult.ContainerName] = containerResult.MemoryBytes
+		for i, query := range queries {
+			klog.V(4).Infof("Executing PromQL query %d for container %s in VPA %s/%s: %s", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, query)
+
+			result, _, err := e.promClient.Query(ctx, query, time.Now())
+			if err != nil {
+				klog.Warningf("Failed to execute PromQL query %d for container %s in VPA %s/%s: %v", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, err)
+				continue
+			}
+
+			resMemory, err := e.extractMemoryFromPromqlResult(result)
+			if err != nil {
+				klog.Warningf("Failed to extract container memory from PromQL result %d for container %s in VPA %s/%s: %v", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, err)
+				continue
+			}
+
+			// Track maximum for this container
+			if resMemory > containerMaxMemory[containerName] {
+				containerMaxMemory[containerName] = resMemory
+				klog.V(4).Infof("Updated max memory for container %s: %d bytes (from query %d)", containerName, resMemory, i+1)
 			}
 		}
 	}
@@ -101,6 +110,7 @@ func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *mo
 			ContainerName: containerName,
 			MemoryBytes:   memoryBytes,
 		})
+		klog.V(3).Infof("Final memory recommendation for container %s in VPA %s/%s: %d bytes", containerName, vpa.ID.Namespace, vpa.ID.VpaName, memoryBytes)
 	}
 
 	if len(results) > 0 {
@@ -111,39 +121,40 @@ func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *mo
 	return results, nil
 }
 
-// extractContainerMemoryFromResult extracts container memory values from Prometheus query result
-func (e *VPAPromQLExecutor) extractContainerMemoryFromResult(result prommodel.Value) ([]ContainerMemoryResult, error) {
+// extractMemoryFromPromqlResult extracts container memory values from Prometheus query result
+func (e *VPAPromQLExecutor) extractMemoryFromPromqlResult(result prommodel.Value) (model.ResourceAmount, error) {
 	switch v := result.(type) {
 	case *prommodel.Scalar:
 		// Accept scalar values and apply as memory recommendation
 		memoryBytes, err := extractMemoryBytes(v.Value)
 		if err != nil {
-			return nil, fmt.Errorf("invalid memory value in scalar result: %v", err)
+			return 0, fmt.Errorf("invalid memory value in scalar result: %v", err)
 		}
 
-		return []ContainerMemoryResult{{
-			ContainerName: "default",
-			MemoryBytes:   memoryBytes,
-		}}, nil
+		if memoryBytes < 0 {
+			return 0, fmt.Errorf("negative invalid memory value in scalar result: %d", memoryBytes)
+		}
+
+		return memoryBytes, nil
 	case prommodel.Vector:
 		// Ensure vector has only 1 sample
 		if len(v) != 1 {
-			return nil, fmt.Errorf("vector result must contain exactly 1 sample, got %d samples", len(v))
+			return 0, fmt.Errorf("vector result must contain exactly 1 sample, got %d samples", len(v))
 		}
 
-		sample := v[0]
-		memoryBytes, err := extractMemoryBytes(sample.Value)
+		memoryBytes, err := extractMemoryBytes(v[0].Value)
 		if err != nil {
-			return nil, fmt.Errorf("invalid memory value in vector sample: %v", err)
+			return 0, fmt.Errorf("invalid memory value in vector sample: %v", err)
+		}
+
+		if memoryBytes < 0 {
+			return 0, fmt.Errorf("negative invalid memory value in vector sample: %d", memoryBytes)
 		}
 
 		// Apply the memory recommendation without checking container names
-		return []ContainerMemoryResult{{
-			ContainerName: "default",
-			MemoryBytes:   memoryBytes,
-		}}, nil
+		return memoryBytes, nil
 	default:
-		return nil, fmt.Errorf("unsupported result type: %T", result)
+		return 0, fmt.Errorf("unsupported result type: %T", result)
 	}
 }
 
@@ -171,6 +182,38 @@ func extractContainerName(metric prommodel.Metric) (string, error) {
 	}
 
 	return "", fmt.Errorf("container label not found in metric")
+}
+
+// HasPromQLQueries checks if the VPA has any PromQL query annotations
+func HasPromQLQueries(vpa *model.Vpa) bool {
+	if vpa.Annotations == nil {
+		return false
+	}
+
+	for annotationKey := range vpa.Annotations {
+		if strings.HasPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetPromQLContainers returns the list of container names that have PromQL queries
+func GetPromQLContainers(vpa *model.Vpa) []string {
+	if vpa.Annotations == nil {
+		return nil
+	}
+
+	var containers []string
+	for annotationKey, query := range vpa.Annotations {
+		if strings.HasPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix) {
+			containerName := strings.TrimPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix)
+			if containerName != "" && query != "" {
+				containers = append(containers, containerName)
+			}
+		}
+	}
+	return containers
 }
 
 // parsePromQLQueries parses a semicolon-separated string of PromQL queries
