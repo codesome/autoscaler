@@ -17,7 +17,8 @@ import (
 
 const (
 	// VPA annotation prefix for PromQL queries
-	VPAPromQLQueriesAnnotationPrefix = "vpa.k8s.io/promql-memory-queries."
+	VPAPromQLScaleUpAnnotationPrefix   = "vpa.k8s.io/promql-memory-scale-up."
+	VPAPromQLScaleDownAnnotationPrefix = "vpa.k8s.io/promql-memory-scale-down."
 )
 
 // VPAPromQLExecutor handles execution of PromQL queries from VPA annotations
@@ -52,63 +53,89 @@ func (e *VPAPromQLExecutor) ExecuteVPAPromQLQueries(ctx context.Context, vpa *mo
 	}
 
 	// Find all PromQL query annotations with the format "vpa.k8s.io/promql-memory-queries/<container_name>"
-	containerQueries := make(map[string]string)
+	containerScaleUpQueries := make(map[string]string)
+	containerScaleDownQueries := make(map[string]string)
 	for annotationKey, query := range vpa.Annotations {
-		if strings.HasPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix) {
-			containerName := strings.TrimPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix)
+		if strings.HasPrefix(annotationKey, VPAPromQLScaleUpAnnotationPrefix) {
+			containerName := strings.TrimPrefix(annotationKey, VPAPromQLScaleUpAnnotationPrefix)
 			if containerName != "" && query != "" {
-				containerQueries[containerName] = query
+				containerScaleUpQueries[containerName] = query
+			}
+		}
+		if strings.HasPrefix(annotationKey, VPAPromQLScaleDownAnnotationPrefix) {
+			containerName := strings.TrimPrefix(annotationKey, VPAPromQLScaleDownAnnotationPrefix)
+			if containerName != "" && query != "" {
+				containerScaleDownQueries[containerName] = query
 			}
 		}
 	}
 
-	if len(containerQueries) == 0 {
+	if len(containerScaleUpQueries) == 0 {
 		return nil, nil
 	}
 
-	klog.V(2).Infof("Executing PromQL queries for %d containers in VPA %s/%s", len(containerQueries), vpa.ID.Namespace, vpa.ID.VpaName)
+	klog.V(2).Infof("Executing PromQL queries for %d containers in VPA %s/%s", len(containerScaleUpQueries), vpa.ID.Namespace, vpa.ID.VpaName)
+
+	runQueries := func(containerQueries map[string]string, callback func(queryIdx int, containerName string, memoryBytes model.ResourceAmount)) {
+		for containerName, queryString := range containerQueries {
+			if skipContainer(containerName) {
+				continue
+			}
+			// Parse semicolon-separated queries for this container
+			queries := parsePromQLQueries(queryString)
+			if len(queries) == 0 {
+				continue
+			}
+
+			klog.V(3).Infof("Container %s in VPA %s/%s has %d PromQL queries", containerName, vpa.ID.Namespace, vpa.ID.VpaName, len(queries))
+
+			for i, query := range queries {
+				klog.V(4).Infof("Executing PromQL query %d for container %s in VPA %s/%s: %s", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, query)
+
+				result, _, err := e.promClient.Query(ctx, query, time.Now())
+				if err != nil {
+					klog.Warningf("Failed to execute PromQL query %d for container %s in VPA %s/%s: %v", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, err)
+					continue
+				}
+
+				resMemory, err := e.extractMemoryFromPromqlResult(result)
+				if err != nil {
+					klog.Warningf("Failed to extract container memory from PromQL result %d for container %s in VPA %s/%s: %v", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, err)
+					continue
+				}
+
+				callback(i, containerName, resMemory)
+			}
+		}
+	}
 
 	// Track maximum memory per container across all queries
-	containerMaxMemory := make(map[string]model.ResourceAmount)
-
-	for containerName, queryString := range containerQueries {
-		if skipContainer(containerName) {
-			continue
+	recommendationMemory := make(map[string]model.ResourceAmount)
+	runQueries(containerScaleUpQueries, func(i int, containerName string, memoryBytes model.ResourceAmount) {
+		// Track maximum for this container
+		if memoryBytes > recommendationMemory[containerName] {
+			recommendationMemory[containerName] = memoryBytes
+			klog.V(4).Infof("Scale up: Updated max memory for container %s: %d bytes (from query %d)", containerName, memoryBytes, i+1)
 		}
-		// Parse semicolon-separated queries for this container
-		queries := parsePromQLQueries(queryString)
-		if len(queries) == 0 {
-			continue
+	})
+
+	scaleDownContainerMaxMemory := make(map[string]model.ResourceAmount)
+	runQueries(containerScaleDownQueries, func(i int, containerName string, memoryBytes model.ResourceAmount) {
+		// Track maximum for this container
+		if memoryBytes > scaleDownContainerMaxMemory[containerName] {
+			scaleDownContainerMaxMemory[containerName] = memoryBytes
+			klog.V(4).Infof("Scale down: Updated max memory for container %s: %d bytes (from query %d)", containerName, memoryBytes, i+1)
 		}
+	})
 
-		klog.V(3).Infof("Container %s in VPA %s/%s has %d PromQL queries", containerName, vpa.ID.Namespace, vpa.ID.VpaName, len(queries))
-
-		for i, query := range queries {
-			klog.V(4).Infof("Executing PromQL query %d for container %s in VPA %s/%s: %s", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, query)
-
-			result, _, err := e.promClient.Query(ctx, query, time.Now())
-			if err != nil {
-				klog.Warningf("Failed to execute PromQL query %d for container %s in VPA %s/%s: %v", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, err)
-				continue
-			}
-
-			resMemory, err := e.extractMemoryFromPromqlResult(result)
-			if err != nil {
-				klog.Warningf("Failed to extract container memory from PromQL result %d for container %s in VPA %s/%s: %v", i+1, containerName, vpa.ID.Namespace, vpa.ID.VpaName, err)
-				continue
-			}
-
-			// Track maximum for this container
-			if resMemory > containerMaxMemory[containerName] {
-				containerMaxMemory[containerName] = resMemory
-				klog.V(4).Infof("Updated max memory for container %s: %d bytes (from query %d)", containerName, resMemory, i+1)
-			}
-		}
+	// Scale down numbers override scale up numbers
+	for container, memoryBytes := range scaleDownContainerMaxMemory {
+		recommendationMemory[container] = memoryBytes
 	}
 
 	// Convert map to slice
 	var results []ContainerMemoryResult
-	for containerName, memoryBytes := range containerMaxMemory {
+	for containerName, memoryBytes := range recommendationMemory {
 		results = append(results, ContainerMemoryResult{
 			ContainerName: containerName,
 			MemoryBytes:   memoryBytes,
@@ -187,36 +214,32 @@ func extractContainerName(metric prommodel.Metric) (string, error) {
 	return "", fmt.Errorf("container label not found in metric")
 }
 
-// HasPromQLQueries checks if the VPA has any PromQL query annotations
-func HasPromQLQueries(vpa *model.Vpa) bool {
-	if vpa.Annotations == nil {
-		return false
-	}
-
-	for annotationKey := range vpa.Annotations {
-		if strings.HasPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix) {
-			return true
-		}
-	}
-	return false
-}
-
 // GetPromQLContainers returns the list of container names that have PromQL queries
 func GetPromQLContainers(vpa *model.Vpa) []string {
 	if vpa.Annotations == nil {
 		return nil
 	}
 
-	var containers []string
+	containers := make(map[string]struct{})
 	for annotationKey, query := range vpa.Annotations {
-		if strings.HasPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix) {
-			containerName := strings.TrimPrefix(annotationKey, VPAPromQLQueriesAnnotationPrefix)
-			if containerName != "" && query != "" {
-				containers = append(containers, containerName)
-			}
+		if query == "" {
+			continue
+		}
+		containerName := ""
+		if strings.HasPrefix(annotationKey, VPAPromQLScaleUpAnnotationPrefix) {
+			containerName = strings.TrimPrefix(annotationKey, VPAPromQLScaleUpAnnotationPrefix)
+		} else if strings.HasPrefix(annotationKey, VPAPromQLScaleDownAnnotationPrefix) {
+			containerName = strings.TrimPrefix(annotationKey, VPAPromQLScaleDownAnnotationPrefix)
+		}
+		if containerName != "" {
+			containers[containerName] = struct{}{}
 		}
 	}
-	return containers
+	uniqueContainers := make([]string, 0, len(containers))
+	for containerName := range containers {
+		uniqueContainers = append(uniqueContainers, containerName)
+	}
+	return uniqueContainers
 }
 
 // parsePromQLQueries parses a semicolon-separated string of PromQL queries

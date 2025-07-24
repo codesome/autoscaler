@@ -111,8 +111,8 @@ func processVPAUpdate(r *recommender, vpa *model.Vpa, observedVpa *v1.VerticalPo
 	resources := r.podResourceRecommender.GetRecommendedPodResources(GetContainerNameToAggregateStateMap(vpa))
 
 	// Check if VPA has PromQL queries and override specific containers
-	if r.vpaPromQLExecutor != nil && logic.HasPromQLQueries(vpa) {
-		promqlContainers := logic.GetPromQLContainers(vpa)
+	promqlContainers := logic.GetPromQLContainers(vpa)
+	if r.vpaPromQLExecutor != nil && len(promqlContainers) > 0 {
 		klog.V(2).Infof("VPA %s/%s has PromQL queries for containers: %v", vpa.ID.Namespace, vpa.ID.VpaName, promqlContainers)
 
 		recommendationOverrides := make(map[string]model.ResourceAmount, len(promqlContainers))
